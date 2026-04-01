@@ -14,6 +14,10 @@
       src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"
     ></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/11.7.1/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/11.7.1/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/11.7.1/firebase-firestore-compat.js"></script>
+    <script src="./firebase-config.js"></script>
   </head>
   <body class="bg-gray-50">
     <div id="root" class="p-2 sm:p-4"></div>
@@ -27,14 +31,13 @@
        * - Drag events across days
        * - Drag ranges: first day adjusts start, last day adjusts end, middle moves whole range
        * - Events always render above ranges
-       * - Autosaves to localStorage
+       * - Shared via Firebase Auth + Firestore
        */
 
       // -----------------------------
       // Constants
       // -----------------------------
-      // ✅ bumped to v7 so old localStorage doesn't override your new defaults
-      const STORAGE_KEY = "releaseTimelineState.v7";
+      const STORAGE_KEY = "releaseTimelineState.v8";
       const DAY_MS = 24 * 60 * 60 * 1000;
       const MONTHS = [
         "January",
@@ -52,6 +55,128 @@
       ];
       const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
       const WEEKDAYS_SHORT = ["S", "M", "T", "W", "T", "F", "S"];
+      const ROLE_READER = "reader";
+      const ROLE_WRITER = "writer";
+      const CALENDAR_DOC_ID = "default";
+
+      const DEFAULT_CALENDAR_STATE = {
+        title: "Owlet OnCall",
+        window: { startYear: 2026, startMonth: 2 },
+        events: [
+          {
+            id: "e1",
+            label: "Testflight Build",
+            color: "#000000",
+            dateISO: "2026-03-18",
+          },
+          {
+            id: "e2",
+            label: "App store Release",
+            color: "#000000",
+            dateISO: "2026-04-01",
+          },
+          {
+            id: "e6gwhbx",
+            label: "Data Agreement",
+            color: "#000000",
+            dateISO: "2026-02-26",
+          },
+          {
+            id: "e7paas2",
+            label: "100% Rollout",
+            color: "#000000",
+            dateISO: "2026-05-31",
+          },
+        ],
+        ranges: [
+          {
+            id: "r1",
+            label: "Owlet Dev Sprint",
+            color: "#2a42aa",
+            startISO: "2026-03-04",
+            length: 16,
+          },
+          {
+            id: "r2",
+            label: "Internal Friends and Family",
+            color: "#0071a4",
+            startISO: "2026-03-20",
+            length: 13,
+          },
+          {
+            id: "r8fxdyx",
+            label: "External Friends and Family",
+            color: "#007a5a",
+            startISO: "2026-04-02",
+            length: 5,
+          },
+          {
+            id: "rn9yoiu",
+            label: "1% Rollout",
+            color: "#c01343",
+            startISO: "2026-04-07",
+            length: 7,
+          },
+          {
+            id: "r4pp42s",
+            label: "10% Rollout",
+            color: "#50740e",
+            startISO: "2026-04-21",
+            length: 14,
+          },
+          {
+            id: "r1relp8",
+            label: "50% Rollout",
+            color: "#454447",
+            startISO: "2026-05-05",
+            length: 14,
+          },
+          {
+            id: "re2ea88",
+            label: "5% Rollout",
+            color: "#034526",
+            startISO: "2026-04-14",
+            length: 7,
+          },
+          {
+            id: "rrnk5d4",
+            label: "75% Rollout",
+            color: "#33b679",
+            startISO: "2026-05-19",
+            length: 12,
+          },
+        ],
+      };
+
+      // -----------------------------
+      // Firebase setup
+      // -----------------------------
+      const FIREBASE_CONFIG = window.DEPLOYMENT_CALENDAR_FIREBASE_CONFIG;
+      const FIREBASE_READY = Boolean(
+        FIREBASE_CONFIG &&
+          FIREBASE_CONFIG.apiKey &&
+          FIREBASE_CONFIG.authDomain &&
+          FIREBASE_CONFIG.projectId &&
+          FIREBASE_CONFIG.appId
+      );
+
+      let firebaseApp = null;
+      let auth = null;
+      let db = null;
+      let googleProvider = null;
+
+      if (FIREBASE_READY) {
+        firebaseApp = firebase.apps.length
+          ? firebase.app()
+          : firebase.initializeApp(FIREBASE_CONFIG);
+        auth = firebase.auth();
+        db = firebase.firestore();
+        auth.useDeviceLanguage();
+        googleProvider = new firebase.auth.GoogleAuthProvider();
+        googleProvider.setCustomParameters({ prompt: "select_account" });
+      }
+
+      const serverTimestamp = () => firebase.firestore.FieldValue.serverTimestamp();
 
       // -----------------------------
       // Date helpers
@@ -85,15 +210,10 @@
         return { y: d.getFullYear(), m: d.getMonth() };
       };
 
-      // Build weeks for a month.
-      // - Covers the full month
-      // - Ensures at least 5 weeks so shorter months don't leave a blank hole
-      // - Uses 6 weeks only when needed
       function getMonthWeeks(year, monthIndex, minWeeks = 5) {
         const first = startOfMonth(year, monthIndex);
         const last = endOfMonth(year, monthIndex);
 
-        // Start on the Sunday on/before the 1st
         const start = new Date(first);
         start.setDate(first.getDate() - ((first.getDay() + 7) % 7));
 
@@ -128,40 +248,206 @@
           if (!raw) return defaults;
           const parsed = JSON.parse(raw);
           if (!parsed || typeof parsed !== "object") return defaults;
-          return { ...defaults, ...parsed };
+          return normalizeCalendarData(parsed, defaults);
         } catch {
           return defaults;
         }
       }
+
       function saveState(state) {
         try {
           localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
         } catch {}
       }
-      function useAutoSave(state) {
-        const ref = useRef(state);
-        useEffect(() => {
-          ref.current = state;
-        });
-        useEffect(() => {
-          const id = setInterval(() => saveState(ref.current), 400);
-          return () => clearInterval(id);
-        }, []);
-      }
 
-      // Prevent text selection during drag
       function setGlobalSelecting(enabled) {
         const b = document.body;
         if (enabled) b.classList.remove("select-none");
         else b.classList.add("select-none");
       }
 
+      function normalizeEvent(evt, idx) {
+        if (!evt || typeof evt !== "object") return null;
+        if (typeof evt.dateISO !== "string") return null;
+        return {
+          id:
+            typeof evt.id === "string" && evt.id
+              ? evt.id
+              : `event-${idx}-${Math.random().toString(36).slice(2, 8)}`,
+          label: typeof evt.label === "string" ? evt.label : "Untitled Event",
+          color:
+            typeof evt.color === "string" && evt.color
+              ? evt.color
+              : "#1a73e8",
+          dateISO: evt.dateISO,
+        };
+      }
+
+      function normalizeRange(range, idx) {
+        if (!range || typeof range !== "object") return null;
+        if (typeof range.startISO !== "string") return null;
+        return {
+          id:
+            typeof range.id === "string" && range.id
+              ? range.id
+              : `range-${idx}-${Math.random().toString(36).slice(2, 8)}`,
+          label:
+            typeof range.label === "string" ? range.label : "Untitled Range",
+          color:
+            typeof range.color === "string" && range.color
+              ? range.color
+              : "#33b679",
+          startISO: range.startISO,
+          length: Math.max(1, Number(range.length || 1)),
+        };
+      }
+
+      function normalizeCalendarData(raw, fallback = DEFAULT_CALENDAR_STATE) {
+        const safeWindow = {
+          startYear: Number.isInteger(raw?.window?.startYear)
+            ? raw.window.startYear
+            : fallback.window.startYear,
+          startMonth: Number.isInteger(raw?.window?.startMonth)
+            ? raw.window.startMonth
+            : fallback.window.startMonth,
+        };
+
+        return {
+          title: typeof raw?.title === "string" ? raw.title : fallback.title,
+          window: safeWindow,
+          events: Array.isArray(raw?.events)
+            ? raw.events.map(normalizeEvent).filter(Boolean)
+            : fallback.events,
+          ranges: Array.isArray(raw?.ranges)
+            ? raw.ranges.map(normalizeRange).filter(Boolean)
+            : fallback.ranges,
+        };
+      }
+
+      function serializeCalendarData(state) {
+        return JSON.stringify(normalizeCalendarData(state));
+      }
+
+      function formatTimestamp(value) {
+        if (!value) return "Just now";
+        const date =
+          typeof value.toDate === "function"
+            ? value.toDate()
+            : value instanceof Date
+              ? value
+              : null;
+        return date
+          ? date.toLocaleString([], {
+              year: "numeric",
+              month: "short",
+              day: "numeric",
+              hour: "numeric",
+              minute: "2-digit",
+            })
+          : "Just now";
+      }
+
+      function buildCalendarDocument(state, user) {
+        const normalized = normalizeCalendarData(state);
+        return {
+          ...normalized,
+          updatedAt: serverTimestamp(),
+          updatedByUid: user?.uid ?? null,
+          updatedByEmail: user?.email ?? null,
+        };
+      }
+
       // -----------------------------
       // Components
       // -----------------------------
+      function SignInScreen({ onSignIn, error }) {
+        return (
+          <div className="min-h-[80vh] flex items-center justify-center">
+            <div className="max-w-xl w-full bg-white border rounded-2xl shadow-sm p-6 sm:p-8 space-y-5">
+              <div className="space-y-2">
+                <div className="text-xs font-semibold tracking-[0.2em] uppercase text-blue-600">
+                  Shared Calendar
+                </div>
+                <h1 className="text-3xl font-semibold text-gray-900">
+                  Sign in with Google to open the release timeline
+                </h1>
+                <p className="text-sm text-gray-600 leading-6">
+                  Any Google account can view the calendar after signing in.
+                  Users with edit access can update the schedule and manage who
+                  else gets edit access.
+                </p>
+              </div>
+
+              {error && (
+                <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                  {error}
+                </div>
+              )}
+
+              <button
+                className="w-full sm:w-auto inline-flex items-center justify-center gap-2 rounded-xl bg-blue-600 text-white px-4 py-3 text-sm font-medium shadow-sm hover:bg-blue-700 transition-colors"
+                onClick={onSignIn}
+              >
+                <span>Continue with Google</span>
+              </button>
+            </div>
+          </div>
+        );
+      }
+
+      function SetupScreen() {
+        return (
+          <div className="min-h-[80vh] flex items-center justify-center">
+            <div className="max-w-2xl w-full bg-white border rounded-2xl shadow-sm p-6 sm:p-8 space-y-4">
+              <div className="space-y-2">
+                <div className="text-xs font-semibold tracking-[0.2em] uppercase text-amber-600">
+                  Setup Needed
+                </div>
+                <h1 className="text-2xl font-semibold text-gray-900">
+                  Add your Firebase web app config to enable login
+                </h1>
+                <p className="text-sm text-gray-600 leading-6">
+                  This build is wired for Google login and Firestore, but
+                  `firebase-config.js` still has placeholder values.
+                </p>
+              </div>
+
+              <div className="rounded-xl bg-gray-900 text-gray-100 text-sm p-4 overflow-x-auto">
+                <pre>{`window.DEPLOYMENT_CALENDAR_FIREBASE_CONFIG = {
+  apiKey: "your-api-key",
+  authDomain: "your-project.firebaseapp.com",
+  projectId: "your-project-id",
+  appId: "your-app-id",
+  storageBucket: "your-project.firebasestorage.app",
+  messagingSenderId: "1234567890",
+};`}</pre>
+              </div>
+
+              <p className="text-sm text-gray-600">
+                The README also includes the Firestore rules and the one-time
+                bootstrap step to mark your account as a writer.
+              </p>
+            </div>
+          </div>
+        );
+      }
+
+      function LoadingScreen({ title, body }) {
+        return (
+          <div className="min-h-[50vh] flex items-center justify-center">
+            <div className="bg-white border rounded-2xl shadow-sm px-6 py-8 text-center max-w-md w-full space-y-3">
+              <div className="mx-auto h-10 w-10 rounded-full border-4 border-blue-100 border-t-blue-600 animate-spin"></div>
+              <div className="text-lg font-medium text-gray-900">{title}</div>
+              <div className="text-sm text-gray-600">{body}</div>
+            </div>
+          </div>
+        );
+      }
+
       function Header({
         title,
         setTitle,
+        editable,
         windowStartYear,
         windowStartMonth,
         jumpOptions,
@@ -171,20 +457,42 @@
         onExport,
         onImport,
         onReset,
+        currentUser,
+        onSignOut,
+        setShowPermissions,
       }) {
+        const [avatarBroken, setAvatarBroken] = useState(false);
+        const [menuOpen, setMenuOpen] = useState(false);
+        const menuRef = useRef(null);
+
+        useEffect(() => {
+          setAvatarBroken(false);
+        }, [currentUser?.photoURL]);
+
+        useEffect(() => {
+          function onPointerDown(event) {
+            if (!menuRef.current) return;
+            if (!menuRef.current.contains(event.target)) {
+              setMenuOpen(false);
+            }
+          }
+
+          function onKeyDown(event) {
+            if (event.key === "Escape") setMenuOpen(false);
+          }
+
+          window.addEventListener("pointerdown", onPointerDown);
+          window.addEventListener("keydown", onKeyDown);
+          return () => {
+            window.removeEventListener("pointerdown", onPointerDown);
+            window.removeEventListener("keydown", onKeyDown);
+          };
+        }, []);
+
         return (
           <div className="bg-white border rounded-xl shadow-sm p-3">
-            <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-              <div className="flex items-center gap-3 flex-wrap">
-                <input
-                  className="text-xl font-semibold bg-transparent border-b border-transparent focus:border-gray-300 focus:outline-none px-1 py-1"
-                  value={title}
-                  onChange={(e) => setTitle(e.target.value)}
-                  aria-label="Title"
-                />
-              </div>
-
-              <div className="flex items-center gap-2 flex-wrap">
+            <div className="flex flex-col gap-3 lg:grid lg:grid-cols-[auto_minmax(0,1fr)_auto] lg:items-center">
+              <div className="flex items-center gap-2 flex-wrap lg:order-1">
                 <button
                   className="border rounded-md px-2 py-2 bg-white text-sm"
                   onClick={onPrev}
@@ -210,32 +518,248 @@
                 >
                   ›
                 </button>
+              </div>
 
-                <span className="w-px h-6 bg-gray-200 mx-1 hidden md:block"></span>
+              <div className="min-w-0 flex justify-center lg:order-2">
+                <input
+                  className={`w-full max-w-md text-center text-lg sm:text-xl font-semibold bg-transparent border-b px-1 py-1 min-w-0 ${
+                    editable
+                      ? "border-transparent focus:border-gray-300 focus:outline-none"
+                      : "border-transparent text-gray-900 cursor-default"
+                  }`}
+                  value={title}
+                  readOnly={!editable}
+                  onChange={(e) => setTitle(e.target.value)}
+                  aria-label="Title"
+                />
+              </div>
 
-                <button
-                  className="border rounded-md px-2 py-2 bg-white text-sm"
-                  onClick={onExport}
+              <div className="flex justify-end lg:order-3">
+                <div
+                  ref={menuRef}
+                  className="relative flex items-center min-w-0 max-w-full"
                 >
-                  Export
-                </button>
-                <label className="border rounded-md px-2 py-2 bg-white text-sm cursor-pointer">
-                  Import
-                  <input
-                    type="file"
-                    accept="application/json"
-                    className="hidden"
-                    onChange={(e) =>
-                      e.target.files?.[0] && onImport(e.target.files[0])
-                    }
-                  />
-                </label>
+                  <button
+                    className="flex max-w-full items-center gap-3 rounded-lg px-2 py-1.5 hover:bg-gray-50 transition-colors"
+                    onClick={() => setMenuOpen((prev) => !prev)}
+                    aria-haspopup="menu"
+                    aria-expanded={menuOpen ? "true" : "false"}
+                  >
+                    {currentUser?.photoURL && !avatarBroken ? (
+                      <img
+                        src={currentUser.photoURL}
+                        alt=""
+                        className="h-8 w-8 rounded-full border object-cover shrink-0"
+                        onError={() => setAvatarBroken(true)}
+                      />
+                    ) : (
+                      <div className="h-8 w-8 rounded-full bg-blue-100 text-blue-700 flex items-center justify-center text-xs font-semibold shrink-0">
+                        {(currentUser?.displayName || currentUser?.email || "U")
+                          .slice(0, 1)
+                          .toUpperCase()}
+                      </div>
+                    )}
+                    <div className="min-w-0 text-left">
+                      <div className="text-sm font-medium text-gray-900 truncate max-w-[180px] sm:max-w-[260px]">
+                        {currentUser?.displayName || currentUser?.email}
+                      </div>
+                      <div className="text-xs text-gray-500 truncate max-w-[180px] sm:max-w-[260px]">
+                        {currentUser?.email}
+                      </div>
+                    </div>
+                  </button>
+
+                  {menuOpen && (
+                    <div className="absolute right-0 top-full mt-2 w-52 rounded-xl border bg-white shadow-xl py-2 z-[90]">
+                      {editable && (
+                        <button
+                          className="block w-full text-left px-4 py-2 text-sm hover:bg-gray-50"
+                          onClick={() => {
+                            setMenuOpen(false);
+                            setShowPermissions(true);
+                          }}
+                        >
+                          Manage access
+                        </button>
+                      )}
+
+                      <button
+                        className="block w-full text-left px-4 py-2 text-sm hover:bg-gray-50"
+                        onClick={() => {
+                          setMenuOpen(false);
+                          onExport();
+                        }}
+                      >
+                        Export
+                      </button>
+
+                      {editable && (
+                        <label className="block w-full text-left px-4 py-2 text-sm hover:bg-gray-50 cursor-pointer">
+                          Import
+                          <input
+                            type="file"
+                            accept="application/json"
+                            className="hidden"
+                            onChange={(e) => {
+                              setMenuOpen(false);
+                              e.target.files?.[0] && onImport(e.target.files[0]);
+                            }}
+                          />
+                        </label>
+                      )}
+
+                      {editable && (
+                        <button
+                          className="block w-full text-left px-4 py-2 text-sm hover:bg-gray-50"
+                          onClick={() => {
+                            setMenuOpen(false);
+                            onReset();
+                          }}
+                        >
+                          Reset
+                        </button>
+                      )}
+
+                      <div className="my-2 border-t"></div>
+
+                      <button
+                        className="block w-full text-left px-4 py-2 text-sm hover:bg-gray-50"
+                        onClick={() => {
+                          setMenuOpen(false);
+                          onSignOut();
+                        }}
+                      >
+                        Sign out
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      }
+
+      function PermissionsModal({
+        users,
+        currentUser,
+        show,
+        onClose,
+        roleError,
+        busyRoleUid,
+        onRoleChange,
+      }) {
+        useEffect(() => {
+          if (!show) return;
+
+          function onKeyDown(event) {
+            if (event.key === "Escape") onClose();
+          }
+
+          const previousOverflow = document.body.style.overflow;
+          document.body.style.overflow = "hidden";
+          window.addEventListener("keydown", onKeyDown);
+
+          return () => {
+            document.body.style.overflow = previousOverflow;
+            window.removeEventListener("keydown", onKeyDown);
+          };
+        }, [show, onClose]);
+
+        if (!show) return null;
+
+        return (
+          <div className="fixed inset-0 z-[120] flex items-center justify-center p-4">
+            <button
+              className="absolute inset-0 bg-gray-900/40 backdrop-blur-[1px]"
+              onClick={onClose}
+              aria-label="Close access manager"
+            />
+
+            <div className="relative w-full max-w-4xl bg-white border rounded-2xl shadow-2xl overflow-hidden">
+              <div className="px-5 py-4 border-b flex items-start justify-between gap-4">
+                <div>
+                  <div className="font-medium text-gray-900">Manage Access</div>
+                  <div className="text-sm text-gray-500 mt-1">
+                    Everyone who signs in can view the calendar. People with
+                    edit access can update the calendar and grant or revoke
+                    edit access for other signed-in users.
+                  </div>
+                </div>
                 <button
-                  className="border rounded-md px-2 py-2 bg-red-50 text-sm"
-                  onClick={onReset}
+                  className="shrink-0 rounded-md border px-3 py-2 text-sm bg-white"
+                  onClick={onClose}
                 >
-                  Reset
+                  Close
                 </button>
+              </div>
+
+              {roleError && (
+                <div className="mx-5 mt-4 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                  {roleError}
+                </div>
+              )}
+
+              <div className="overflow-x-auto overflow-y-auto max-h-[70vh]">
+                <table className="min-w-full text-sm">
+                  <thead className="bg-gray-50 text-gray-500 sticky top-0">
+                    <tr>
+                      <th className="text-left font-medium px-5 py-3">User</th>
+                      <th className="text-left font-medium px-5 py-3">Role</th>
+                      <th className="text-left font-medium px-5 py-3">
+                        Last login
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {users.map((entry) => {
+                      const isSelf = entry.uid === currentUser?.uid;
+                      return (
+                        <tr key={entry.uid} className="border-t align-top">
+                          <td className="px-5 py-3">
+                            <div className="font-medium text-gray-900">
+                              {entry.displayName || "Unnamed user"}
+                              {isSelf && (
+                                <span className="ml-2 rounded-full bg-blue-100 text-blue-700 px-2 py-0.5 text-xs">
+                                  You
+                                </span>
+                              )}
+                            </div>
+                            <div className="text-gray-500">{entry.email}</div>
+                          </td>
+                          <td className="px-5 py-3">
+                            <select
+                              className="border rounded-md px-2 py-2 bg-white text-sm"
+                              value={entry.role === ROLE_WRITER ? ROLE_WRITER : ROLE_READER}
+                              disabled={isSelf || busyRoleUid === entry.uid}
+                              onChange={(e) =>
+                                onRoleChange(entry.uid, e.target.value)
+                              }
+                            >
+                              <option value={ROLE_READER}>Read-only</option>
+                              <option value={ROLE_WRITER}>Edit access</option>
+                            </select>
+                            {isSelf && (
+                              <div className="text-xs text-gray-500 mt-1">
+                                Your own role is managed outside this table to
+                                avoid accidental lockout.
+                              </div>
+                            )}
+                          </td>
+                          <td className="px-5 py-3 text-gray-500">
+                            {formatTimestamp(entry.lastLoginAt)}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+
+                {!users.length && (
+                  <div className="px-5 py-8 text-center text-sm text-gray-500">
+                    No signed-in users yet.
+                  </div>
+                )}
               </div>
             </div>
           </div>
@@ -248,6 +772,7 @@
         today,
         events,
         ranges,
+        editable,
         onEventDragStart,
         onRangeDragStart,
         onRangeResizeStart,
@@ -295,10 +820,10 @@
                       } hover:bg-blue-50/40 transition-colors overflow-hidden`}
                     >
                       {isToday && (
-                        <div className="absolute inset-0 bg-blue-50/40 pointer-events-none z-0" />
-                      )}
-                      {isToday && (
-                        <div className="absolute inset-0 rounded-md ring-4 ring-blue-600 pointer-events-none z-50" />
+                        <>
+                          <div className="absolute inset-0 bg-blue-100/70 pointer-events-none z-0" />
+                          <div className="absolute inset-0 rounded-md ring-2 ring-blue-500 shadow-[inset_0_0_0_1px_rgba(59,130,246,0.35)] pointer-events-none z-50" />
+                        </>
                       )}
 
                       {rangesInCell.map((r) => {
@@ -312,15 +837,19 @@
                         return (
                           <div
                             key={r.id}
-                            className={`absolute inset-0 rounded-md cursor-move select-none z-10 ${
+                            className={`absolute inset-0 rounded-md select-none z-10 ${
                               faded ? "opacity-40" : ""
-                            }`}
-                            onPointerDown={(e) => {
-                              e.preventDefault();
-                              if (isStart) onRangeResizeStart(r.id);
-                              else if (isEnd) onRangeResizeEnd(r.id);
-                              else onRangeDragStart(r.id, iso);
-                            }}
+                            } ${editable ? "cursor-move" : "cursor-default"}`}
+                            onPointerDown={
+                              editable
+                                ? (e) => {
+                                    e.preventDefault();
+                                    if (isStart) onRangeResizeStart(r.id);
+                                    else if (isEnd) onRangeResizeEnd(r.id);
+                                    else onRangeDragStart(r.id, iso);
+                                  }
+                                : undefined
+                            }
                             style={{
                               background: r.color + "22",
                               outline:
@@ -334,7 +863,7 @@
                             }}
                           >
                             {isStart && (
-                              <div className="absolute left-1 sm:left-2 top-1 sm:top-2">
+                              <div className="absolute left-1 sm:left-2 top-5 sm:top-6">
                                 <span
                                   className="px-1 sm:px-2 py-0.5 text-[9px] sm:text-xs rounded-md text-white truncate max-w-[60px] sm:max-w-none inline-block"
                                   style={{ background: r.color }}
@@ -347,12 +876,19 @@
                         );
                       })}
 
-                      <div
-                        className={`absolute right-1 sm:right-2 bottom-1 sm:bottom-2 text-[9px] sm:text-[10px] z-30 ${
-                          cellPast ? "text-gray-400" : "text-gray-500"
-                        }`}
-                      >
-                        {date.getDate()}
+                      <div className="absolute right-1 sm:right-2 top-1 sm:top-2 z-30">
+                        <div
+                          className={`text-[9px] sm:text-[10px] ${
+                            isToday
+                              ? "h-5 w-5 sm:h-6 sm:w-6 rounded-full bg-blue-600 text-white font-semibold flex items-center justify-center shadow-sm"
+                              : cellPast
+                                ? "text-gray-400"
+                                : "text-gray-500"
+                          }`}
+                          aria-label={isToday ? "Today" : undefined}
+                        >
+                          {date.getDate()}
+                        </div>
                       </div>
 
                       <div className="relative space-y-0.5 sm:space-y-1 pt-4 sm:pt-8 z-40 max-h-[40px] sm:max-h-[60px] lg:max-h-[110px] overflow-y-auto overflow-x-hidden pr-1">
@@ -361,14 +897,18 @@
                           return (
                             <div
                               key={evt.id}
-                              className={`block w-full max-w-full rounded-md text-[10px] sm:text-xs cursor-grab active:cursor-grabbing shadow select-none bg-white/85 backdrop-blur px-1 sm:px-2 py-0.5 sm:py-1 ${
+                              className={`block w-full max-w-full rounded-md text-[10px] sm:text-xs shadow select-none bg-white/85 backdrop-blur px-1 sm:px-2 py-0.5 sm:py-1 ${
                                 evtPast ? "opacity-45" : ""
-                              }`}
+                              } ${editable ? "cursor-grab active:cursor-grabbing" : ""}`}
                               style={{ border: `1px solid ${evt.color}` }}
-                              onPointerDown={(e) => {
-                                e.preventDefault();
-                                onEventDragStart(evt.id, iso);
-                              }}
+                              onPointerDown={
+                                editable
+                                  ? (e) => {
+                                      e.preventDefault();
+                                      onEventDragStart(evt.id, iso);
+                                    }
+                                  : undefined
+                              }
                               title={evt.label}
                             >
                               <div className="font-medium text-gray-900 whitespace-normal break-words leading-snug">
@@ -573,6 +1113,16 @@
         );
       }
 
+      function ReadOnlyNotice() {
+        return (
+          <div className="bg-white border rounded-xl shadow-sm px-4 py-3 text-sm text-gray-600">
+            You currently have read-only access. Someone with edit access can
+            grant you edit access from the permissions panel after you have
+            signed in once.
+          </div>
+        );
+      }
+
       // -----------------------------
       // App
       // -----------------------------
@@ -580,60 +1130,232 @@
         const now = new Date();
         const today = startOfDay(now);
 
-        // ✅ seeded defaults from your JSON
-        const defaultWindow = { startYear: 2026, startMonth: 2 };
         const defaults = useMemo(
-          () => ({
-            title: "Owlet OnCall",
-            window: { startYear: 2026, startMonth: 2 },
-            events: [
-              { id: "e1", label: "Testflight Build", color: "#000000", dateISO: "2026-03-18" },
-              { id: "e2", label: "App store Release", color: "#000000", dateISO: "2026-04-01" },
-              { id: "e6gwhbx", label: "Data Agreement", color: "#000000", dateISO: "2026-02-26" },
-              { id: "e7paas2", label: "100% Rollout", color: "#000000", dateISO: "2026-05-31" }
-            ],
-            ranges: [
-              { id: "r1", label: "Owlet Dev Sprint", color: "#2a42aa", startISO: "2026-03-04", length: 16 },
-              { id: "r2", label: "Internal Friends and Family", color: "#0071a4", startISO: "2026-03-20", length: 13 },
-              { id: "r8fxdyx", label: "External Friends and Family", color: "#007a5a", startISO: "2026-04-02", length: 5 },
-              { id: "rn9yoiu", label: "1% Rollout", color: "#c01343", startISO: "2026-04-07", length: 7 },
-              { id: "r4pp42s", label: "10% Rollout", color: "#50740e", startISO: "2026-04-21", length: 14 },
-              { id: "r1relp8", label: "50% Rollout", color: "#454447", startISO: "2026-05-05", length: 14 },
-              { id: "re2ea88", label: "5% Rollout", color: "#034526", startISO: "2026-04-14", length: 7 },
-              { id: "rrnk5d4", label: "75% Rollout", color: "#33b679", startISO: "2026-05-19", length: 12 }
-            ]
-          }),
+          () => normalizeCalendarData(DEFAULT_CALENDAR_STATE),
+          []
+        );
+        const legacyState = useMemo(() => loadState(defaults), [defaults]);
+
+        const [calendarState, setCalendarState] = useState(legacyState);
+        const [authReady, setAuthReady] = useState(!FIREBASE_READY);
+        const [currentUser, setCurrentUser] = useState(null);
+        const [authError, setAuthError] = useState("");
+        const [userRecord, setUserRecord] = useState(null);
+        const [calendarStatus, setCalendarStatus] = useState(
+          FIREBASE_READY ? "loading" : "setup"
+        );
+        const [calendarError, setCalendarError] = useState("");
+        const [calendarMissing, setCalendarMissing] = useState(false);
+        const [users, setUsers] = useState([]);
+        const [roleError, setRoleError] = useState("");
+        const [busyRoleUid, setBusyRoleUid] = useState(null);
+        const [showPermissions, setShowPermissions] = useState(false);
+
+        const calendarRef = useMemo(
+          () => (db ? db.collection("calendars").doc(CALENDAR_DOC_ID) : null),
           []
         );
 
-        const persisted = loadState(defaults);
-
-        const [title, setTitle] = useState(persisted.title ?? defaults.title);
-        const [windowStartYear, setWindowStartYear] = useState(
-          persisted.window?.startYear ?? defaults.window.startYear
-        );
-        const [windowStartMonth, setWindowStartMonth] = useState(
-          persisted.window?.startMonth ?? defaults.window.startMonth
-        );
-        const [events, setEvents] = useState(persisted.events ?? defaults.events);
-        const [ranges, setRanges] = useState(persisted.ranges ?? defaults.ranges);
-
-        useAutoSave({
-          title,
-          window: { startYear: windowStartYear, startMonth: windowStartMonth },
-          events,
-          ranges
-        });
-
-        const visibleMonths = useMemo(
-          () => [0, 1, 2].map((i) => addMonths(windowStartYear, windowStartMonth, i)),
-          [windowStartYear, windowStartMonth]
-        );
-
+        const lastRemoteSerializedRef = useRef("");
+        const lastSavedSerializedRef = useRef("");
         const dragState = useRef(null);
         const [hoverISO, setHoverISO] = useState(null);
 
+        const title = calendarState.title;
+        const windowStartYear = calendarState.window.startYear;
+        const windowStartMonth = calendarState.window.startMonth;
+        const events = calendarState.events;
+        const ranges = calendarState.ranges;
+        const isWriter = userRecord?.role === ROLE_WRITER;
+
         useEffect(() => {
+          saveState(calendarState);
+        }, [calendarState]);
+
+        useEffect(() => {
+          if (!FIREBASE_READY || !auth) return;
+          const unsubscribe = auth.onAuthStateChanged((user) => {
+            setCurrentUser(user);
+            setAuthReady(true);
+            setAuthError("");
+            setRoleError("");
+            if (!user) {
+              setUserRecord(null);
+              setUsers([]);
+              setShowPermissions(false);
+            }
+          });
+          return unsubscribe;
+        }, []);
+
+        useEffect(() => {
+          if (!db || !currentUser) return;
+          let cancelled = false;
+          const ref = db.collection("users").doc(currentUser.uid);
+
+          db.runTransaction(async (transaction) => {
+            const snapshot = await transaction.get(ref);
+            const profileUpdate = {
+              uid: currentUser.uid,
+              email: currentUser.email || "",
+              displayName: currentUser.displayName || "",
+              photoURL: currentUser.photoURL || "",
+              lastLoginAt: serverTimestamp(),
+            };
+
+            if (!snapshot.exists) {
+              transaction.set(ref, {
+                ...profileUpdate,
+                role: ROLE_READER,
+                createdAt: serverTimestamp(),
+              });
+              return;
+            }
+
+            transaction.update(ref, profileUpdate);
+          }).catch((error) => {
+            if (!cancelled) {
+              setAuthError(error.message || "Unable to sync your user profile.");
+            }
+          });
+
+          const unsubscribe = ref.onSnapshot(
+            (snapshot) => {
+              if (cancelled) return;
+              setAuthError("");
+              setUserRecord(snapshot.exists ? snapshot.data() : null);
+            },
+            (error) => {
+              if (!cancelled) {
+                setAuthError(
+                  error.message || "Unable to load your permissions."
+                );
+              }
+            }
+          );
+
+          return () => {
+            cancelled = true;
+            unsubscribe();
+          };
+        }, [currentUser]);
+
+        useEffect(() => {
+          if (!db || !currentUser) {
+            setCalendarStatus(currentUser ? "loading" : "signed-out");
+            setCalendarMissing(false);
+            return;
+          }
+
+          setCalendarStatus("loading");
+          setCalendarError("");
+
+          const unsubscribe = calendarRef.onSnapshot(
+            (snapshot) => {
+              if (!snapshot.exists) {
+                setCalendarMissing(true);
+                setCalendarStatus("missing");
+                lastRemoteSerializedRef.current = "";
+                lastSavedSerializedRef.current = "";
+                return;
+              }
+
+              const nextState = normalizeCalendarData(snapshot.data(), defaults);
+              const serialized = serializeCalendarData(nextState);
+              lastRemoteSerializedRef.current = serialized;
+              lastSavedSerializedRef.current = serialized;
+              setCalendarError("");
+              setCalendarState(nextState);
+              setCalendarMissing(false);
+              setCalendarStatus("ready");
+            },
+            (error) => {
+              setCalendarError(
+                error.message || "Unable to load the shared calendar."
+              );
+              setCalendarStatus("error");
+            }
+          );
+
+          return unsubscribe;
+        }, [currentUser, defaults, calendarRef]);
+
+        useEffect(() => {
+          if (!db || !currentUser || !isWriter) {
+            setUsers([]);
+            return;
+          }
+
+          const unsubscribe = db
+            .collection("users")
+            .orderBy("lastLoginAt", "desc")
+            .onSnapshot(
+              (snapshot) => {
+                setRoleError("");
+                setUsers(snapshot.docs.map((doc) => doc.data()));
+              },
+              (error) => {
+                setRoleError(
+                  error.message || "Unable to load signed-in users."
+                );
+              }
+            );
+
+          return unsubscribe;
+        }, [currentUser, isWriter]);
+
+        useEffect(() => {
+          if (
+            !db ||
+            !currentUser ||
+            !isWriter ||
+            calendarStatus !== "ready" ||
+            calendarMissing
+          ) {
+            return;
+          }
+
+          const serialized = serializeCalendarData(calendarState);
+          if (
+            serialized === lastRemoteSerializedRef.current ||
+            serialized === lastSavedSerializedRef.current
+          ) {
+            return;
+          }
+
+          const timeoutId = setTimeout(() => {
+            lastSavedSerializedRef.current = serialized;
+            calendarRef
+              .set(buildCalendarDocument(calendarState, currentUser))
+              .catch((error) => {
+                setCalendarError(
+                  error.message || "Unable to save the shared calendar."
+                );
+              });
+          }, 350);
+
+          return () => clearTimeout(timeoutId);
+        }, [
+          calendarState,
+          calendarStatus,
+          calendarMissing,
+          currentUser,
+          isWriter,
+          calendarRef,
+        ]);
+
+        useEffect(() => {
+          const windowStartDate = startOfMonth(windowStartYear, windowStartMonth);
+          const lastVisibleMonth = addMonths(windowStartYear, windowStartMonth, 2);
+          const windowEndDate = endOfMonth(lastVisibleMonth.y, lastVisibleMonth.m);
+
+          const clampToWindow = (d) =>
+            d < windowStartDate
+              ? new Date(windowStartDate)
+              : d > windowEndDate
+                ? new Date(windowEndDate)
+                : d;
+
           function onMove(ev) {
             if (!dragState.current) return;
             const el = document.elementFromPoint(ev.clientX, ev.clientY);
@@ -641,6 +1363,7 @@
             const iso = cell && cell.getAttribute("data-date");
             if (iso) setHoverISO(iso);
           }
+
           function onUp() {
             if (!dragState.current) return;
             const state = dragState.current;
@@ -651,63 +1374,69 @@
               return;
             }
 
-            const windowStartDate = startOfMonth(windowStartYear, windowStartMonth);
-            const last = addMonths(windowStartYear, windowStartMonth, 2);
-            const windowEndDate = endOfMonth(last.y, last.m);
-            const clamp = (d) =>
-              d < windowStartDate ? new Date(windowStartDate)
-              : d > windowEndDate ? new Date(windowEndDate)
-              : d;
+            setCalendarState((prevState) => {
+              switch (state.kind) {
+                case "event":
+                  return {
+                    ...prevState,
+                    events: prevState.events.map((evt) =>
+                      evt.id === state.id
+                        ? { ...evt, dateISO: toISO(clampToWindow(fromISO(iso))) }
+                        : evt
+                    ),
+                  };
 
-            if (state.kind === "event") {
-              setEvents((prev) =>
-                prev.map((e) =>
-                  e.id === state.id ? { ...e, dateISO: toISO(clamp(fromISO(iso))) } : e
-                )
-              );
-            }
+                case "range-move":
+                  return {
+                    ...prevState,
+                    ranges: prevState.ranges.map((r) => {
+                      if (r.id !== state.id) return r;
+                      let newStart = addDays(fromISO(iso), -state.offset);
+                      const latestStart = addDays(windowEndDate, -(r.length - 1));
+                      if (newStart < windowStartDate) {
+                        newStart = new Date(windowStartDate);
+                      }
+                      if (newStart > latestStart) newStart = latestStart;
+                      return { ...r, startISO: toISO(newStart) };
+                    }),
+                  };
 
-            if (state.kind === "range-move") {
-              setRanges((prev) =>
-                prev.map((r) => {
-                  if (r.id !== state.id) return r;
-                  let newStart = addDays(fromISO(iso), -state.offset);
-                  const latestStart = addDays(windowEndDate, -(r.length - 1));
-                  if (newStart < windowStartDate) newStart = new Date(windowStartDate);
-                  if (newStart > latestStart) newStart = latestStart;
-                  return { ...r, startISO: toISO(newStart) };
-                })
-              );
-            }
+                case "range-resize-left":
+                  return {
+                    ...prevState,
+                    ranges: prevState.ranges.map((r) => {
+                      if (r.id !== state.id) return r;
+                      let newStart = fromISO(iso);
+                      const endEx = addDays(fromISO(r.startISO), r.length);
+                      if (newStart >= endEx) newStart = addDays(endEx, -1);
+                      if (newStart < windowStartDate) {
+                        newStart = new Date(windowStartDate);
+                      }
+                      const newLen = Math.max(1, dayDiff(endEx, newStart));
+                      return { ...r, startISO: toISO(newStart), length: newLen };
+                    }),
+                  };
 
-            if (state.kind === "range-resize-left") {
-              setRanges((prev) =>
-                prev.map((r) => {
-                  if (r.id !== state.id) return r;
-                  let newStart = fromISO(iso);
-                  const endEx = addDays(fromISO(r.startISO), r.length);
-                  if (newStart >= endEx) newStart = addDays(endEx, -1);
-                  if (newStart < windowStartDate) newStart = new Date(windowStartDate);
-                  const newLen = Math.max(1, dayDiff(endEx, newStart));
-                  return { ...r, startISO: toISO(newStart), length: newLen };
-                })
-              );
-            }
+                case "range-resize-right":
+                  return {
+                    ...prevState,
+                    ranges: prevState.ranges.map((r) => {
+                      if (r.id !== state.id) return r;
+                      let newEndEx = addDays(fromISO(iso), 1);
+                      const start = fromISO(r.startISO);
+                      if (newEndEx <= start) newEndEx = addDays(start, 1);
+                      if (newEndEx > addDays(windowEndDate, 1)) {
+                        newEndEx = addDays(windowEndDate, 1);
+                      }
+                      const newLen = Math.max(1, dayDiff(newEndEx, start));
+                      return { ...r, length: newLen };
+                    }),
+                  };
 
-            if (state.kind === "range-resize-right") {
-              setRanges((prev) =>
-                prev.map((r) => {
-                  if (r.id !== state.id) return r;
-                  let newEndEx = addDays(fromISO(iso), 1);
-                  const start = fromISO(r.startISO);
-                  if (newEndEx <= start) newEndEx = addDays(start, 1);
-                  if (newEndEx > addDays(windowEndDate, 1))
-                    newEndEx = addDays(windowEndDate, 1);
-                  const newLen = Math.max(1, dayDiff(newEndEx, start));
-                  return { ...r, length: newLen };
-                })
-              );
-            }
+                default:
+                  return prevState;
+              }
+            });
 
             setHoverISO(null);
             setGlobalSelecting(true);
@@ -721,38 +1450,11 @@
           };
         }, [hoverISO, windowStartYear, windowStartMonth]);
 
-        function onEventDragStart(id, iso) {
-          dragState.current = { kind: "event", id };
-          setHoverISO(iso);
-          setGlobalSelecting(false);
-        }
-        function onRangeDragStart(id, iso) {
-          const r = ranges.find((x) => x.id === id);
-          if (!r) return;
-          const offset = dayDiff(fromISO(iso), fromISO(r.startISO));
-          dragState.current = { kind: "range-move", id, offset };
-          setHoverISO(iso);
-          setGlobalSelecting(false);
-        }
-        function onRangeResizeStart(id) {
-          dragState.current = { kind: "range-resize-left", id };
-          setGlobalSelecting(false);
-        }
-        function onRangeResizeEnd(id) {
-          dragState.current = { kind: "range-resize-right", id };
-          setGlobalSelecting(false);
-        }
+        const visibleMonths = useMemo(
+          () => [0, 1, 2].map((i) => addMonths(windowStartYear, windowStartMonth, i)),
+          [windowStartYear, windowStartMonth]
+        );
 
-        function pageMonths(delta) {
-          const next = addMonths(windowStartYear, windowStartMonth, delta);
-          setWindowStartYear(next.y);
-          setWindowStartMonth(next.m);
-        }
-        function jumpToMonth(ym) {
-          const [yy, mm] = ym.split("-").map(Number);
-          setWindowStartYear(yy);
-          setWindowStartMonth(mm - 1);
-        }
         const jumpOptions = useMemo(() => {
           const opts = [];
           for (let i = -12; i <= 12; i++) {
@@ -765,18 +1467,102 @@
           );
         }, [windowStartYear, windowStartMonth]);
 
-        function onReset() {
-          localStorage.removeItem(STORAGE_KEY);
-          location.reload();
+        function updateCalendar(mutator) {
+          setCalendarState((prev) => normalizeCalendarData(mutator(prev), defaults));
         }
+
+        function setTitle(value) {
+          updateCalendar((prev) => ({ ...prev, title: value }));
+        }
+
+        function setEvents(updater) {
+          updateCalendar((prev) => ({
+            ...prev,
+            events:
+              typeof updater === "function" ? updater(prev.events) : updater,
+          }));
+        }
+
+        function setRanges(updater) {
+          updateCalendar((prev) => ({
+            ...prev,
+            ranges:
+              typeof updater === "function" ? updater(prev.ranges) : updater,
+          }));
+        }
+
+        function onEventDragStart(id, iso) {
+          if (!isWriter) return;
+          dragState.current = { kind: "event", id };
+          setHoverISO(iso);
+          setGlobalSelecting(false);
+        }
+
+        function onRangeDragStart(id, iso) {
+          if (!isWriter) return;
+          const range = ranges.find((x) => x.id === id);
+          if (!range) return;
+          const offset = dayDiff(fromISO(iso), fromISO(range.startISO));
+          dragState.current = { kind: "range-move", id, offset };
+          setHoverISO(iso);
+          setGlobalSelecting(false);
+        }
+
+        function onRangeResizeStart(id) {
+          if (!isWriter) return;
+          dragState.current = { kind: "range-resize-left", id };
+          setGlobalSelecting(false);
+        }
+
+        function onRangeResizeEnd(id) {
+          if (!isWriter) return;
+          dragState.current = { kind: "range-resize-right", id };
+          setGlobalSelecting(false);
+        }
+
+        function pageMonths(delta) {
+          const next = addMonths(windowStartYear, windowStartMonth, delta);
+          updateCalendar((prev) => ({
+            ...prev,
+            window: { startYear: next.y, startMonth: next.m },
+          }));
+        }
+
+        function jumpToMonth(ym) {
+          const [yy, mm] = ym.split("-").map(Number);
+          updateCalendar((prev) => ({
+            ...prev,
+            window: { startYear: yy, startMonth: mm - 1 },
+          }));
+        }
+
+        async function signIn() {
+          if (!auth || !googleProvider) return;
+          try {
+            await auth.signInWithPopup(googleProvider);
+          } catch (error) {
+            if (
+              error?.code === "auth/popup-blocked" ||
+              error?.code === "auth/cancelled-popup-request"
+            ) {
+              await auth.signInWithRedirect(googleProvider);
+              return;
+            }
+            setAuthError(error.message || "Google sign-in failed.");
+          }
+        }
+
+        async function signOutUser() {
+          if (!auth) return;
+          await auth.signOut();
+          setCalendarState(loadState(defaults));
+        }
+
         function onExport() {
-          const data = {
-            title,
-            window: { startYear: windowStartYear, startMonth: windowStartMonth },
-            events,
-            ranges
-          };
-          const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+          const data = normalizeCalendarData(calendarState, defaults);
+          const blob = new Blob([JSON.stringify(data, null, 2)], {
+            type: "application/json",
+          });
           const url = URL.createObjectURL(blob);
           const a = document.createElement("a");
           a.href = url;
@@ -784,27 +1570,40 @@
           a.click();
           URL.revokeObjectURL(url);
         }
+
         function onImport(file) {
+          if (!isWriter) return;
           const reader = new FileReader();
           reader.onload = (e) => {
             try {
               const data = JSON.parse(e.target.result);
-              if (typeof data.title === "string") setTitle(data.title);
-              if (data.window?.startYear != null) setWindowStartYear(data.window.startYear);
-              if (data.window?.startMonth != null) setWindowStartMonth(data.window.startMonth);
-              if (Array.isArray(data.events)) setEvents(data.events);
-              if (Array.isArray(data.ranges)) setRanges(data.ranges);
-              saveState({
-                title: data.title ?? title,
-                window: data.window ?? { startYear: windowStartYear, startMonth: windowStartMonth },
-                events: data.events ?? events,
-                ranges: data.ranges ?? ranges
-              });
+              setCalendarState(normalizeCalendarData(data, defaults));
             } catch {
               alert("Invalid JSON");
             }
           };
           reader.readAsText(file);
+        }
+
+        function onReset() {
+          if (!isWriter) return;
+          const shouldReset = window.confirm(
+            "Reset the shared calendar back to the seeded default timeline?"
+          );
+          if (!shouldReset) return;
+          setCalendarState(defaults);
+        }
+
+        async function initializeCalendar() {
+          if (!calendarRef || !currentUser || !isWriter) return;
+          setCalendarError("");
+          try {
+            await calendarRef.set(buildCalendarDocument(calendarState, currentUser));
+          } catch (error) {
+            setCalendarError(
+              error.message || "Unable to initialize the shared calendar."
+            );
+          }
         }
 
         const addEvent = () =>
@@ -817,8 +1616,10 @@
               dateISO: toISO(startOfMonth(windowStartYear, windowStartMonth)),
             },
           ]);
+
         const delEvent = (id) =>
-          setEvents((prev) => prev.filter((e) => e.id !== id));
+          setEvents((prev) => prev.filter((evt) => evt.id !== id));
+
         const addRange = () =>
           setRanges((prev) => [
             ...prev,
@@ -830,14 +1631,77 @@
               length: 5,
             },
           ]);
+
         const delRange = (id) =>
-          setRanges((prev) => prev.filter((r) => r.id !== id));
+          setRanges((prev) => prev.filter((range) => range.id !== id));
+
+        async function onRoleChange(uid, nextRole) {
+          if (!db || !isWriter || uid === currentUser?.uid) return;
+          setBusyRoleUid(uid);
+          setRoleError("");
+
+          try {
+            const ref = db.collection("users").doc(uid);
+            await db.runTransaction(async (transaction) => {
+              const snapshot = await transaction.get(ref);
+              if (!snapshot.exists) {
+                throw new Error("That user profile no longer exists.");
+              }
+              transaction.update(ref, {
+                role: nextRole === ROLE_WRITER ? ROLE_WRITER : ROLE_READER,
+                roleUpdatedAt: serverTimestamp(),
+                roleUpdatedByUid: currentUser?.uid ?? null,
+                roleUpdatedByEmail: currentUser?.email ?? null,
+              });
+            });
+          } catch (error) {
+            setRoleError(error.message || "Unable to update that user's role.");
+          } finally {
+            setBusyRoleUid(null);
+          }
+        }
+
+        if (!FIREBASE_READY) {
+          return <SetupScreen />;
+        }
+
+        if (!authReady) {
+          return (
+            <LoadingScreen
+              title="Checking your sign-in session"
+              body="Restoring your Google session and loading permissions."
+            />
+          );
+        }
+
+        if (!currentUser) {
+          return <SignInScreen onSignIn={signIn} error={authError} />;
+        }
+
+        if (!userRecord) {
+          return (
+            <LoadingScreen
+              title="Preparing your access"
+              body="Creating or refreshing your user profile in Firestore."
+            />
+          );
+        }
+
+        if (calendarStatus === "loading") {
+          return (
+            <LoadingScreen
+              title="Loading shared calendar"
+              body="Connecting to Firestore and syncing the latest timeline."
+            />
+          );
+        }
 
         return (
           <div className="space-y-4">
             <Header
               title={title}
               setTitle={setTitle}
+              editable={isWriter}
               windowStartYear={windowStartYear}
               windowStartMonth={windowStartMonth}
               jumpOptions={jumpOptions}
@@ -847,43 +1711,101 @@
               onExport={onExport}
               onImport={onImport}
               onReset={onReset}
+              currentUser={currentUser}
+              onSignOut={signOutUser}
+              setShowPermissions={setShowPermissions}
             />
 
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-              {visibleMonths.map(({ y, m }) => (
-                <MonthView
-                  key={`${y}-${m}`}
-                  year={y}
-                  month={m}
-                  today={today}
-                  events={events}
-                  ranges={ranges}
-                  onEventDragStart={onEventDragStart}
-                  onRangeDragStart={onRangeDragStart}
-                  onRangeResizeStart={onRangeResizeStart}
-                  onRangeResizeEnd={onRangeResizeEnd}
-                />
-              ))}
-            </div>
+            {authError && (
+              <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                {authError}
+              </div>
+            )}
 
-            <div className="grid md:grid-cols-2 gap-4">
-              <EventsEditor
-                events={events}
-                setEvents={setEvents}
-                onAdd={addEvent}
-                onDelete={delEvent}
-              />
-              <RangesEditor
-                ranges={ranges}
-                setRanges={setRanges}
-                onAdd={addRange}
-                onDelete={delRange}
-              />
-            </div>
+            {calendarError && (
+              <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                {calendarError}
+              </div>
+            )}
 
-            <div className="text-xs text-gray-500">
-              Autosaves locally. Use the month dropdown + arrows to page. Drag events to move them. For ranges: drag the first day to adjust the start, the last day to adjust the end, or any middle day to move the whole range.
-            </div>
+            {isWriter && (
+              <PermissionsModal
+                users={users}
+                currentUser={currentUser}
+                show={showPermissions}
+                onClose={() => setShowPermissions(false)}
+                roleError={roleError}
+                busyRoleUid={busyRoleUid}
+                onRoleChange={onRoleChange}
+              />
+            )}
+
+            {calendarMissing ? (
+              <div className="bg-white border rounded-xl shadow-sm px-4 py-5 space-y-3">
+                <div className="text-lg font-medium text-gray-900">
+                  Shared calendar is not initialized yet
+                </div>
+                <div className="text-sm text-gray-600">
+                  {isWriter
+                    ? "Initialize Firestore with the current local calendar data to start sharing it with signed-in users."
+                    : "A writer needs to initialize the shared calendar before it can be viewed here."}
+                </div>
+                {isWriter && (
+                  <button
+                    className="inline-flex items-center rounded-xl bg-blue-600 text-white px-4 py-2.5 text-sm font-medium hover:bg-blue-700 transition-colors"
+                    onClick={initializeCalendar}
+                  >
+                    Initialize shared calendar
+                  </button>
+                )}
+              </div>
+            ) : calendarStatus === "error" ? null : (
+              <>
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                  {visibleMonths.map(({ y, m }) => (
+                    <MonthView
+                      key={`${y}-${m}`}
+                      year={y}
+                      month={m}
+                      today={today}
+                      events={events}
+                      ranges={ranges}
+                      editable={isWriter}
+                      onEventDragStart={onEventDragStart}
+                      onRangeDragStart={onRangeDragStart}
+                      onRangeResizeStart={onRangeResizeStart}
+                      onRangeResizeEnd={onRangeResizeEnd}
+                    />
+                  ))}
+                </div>
+
+                {isWriter ? (
+                  <div className="grid md:grid-cols-2 gap-4">
+                    <EventsEditor
+                      events={events}
+                      setEvents={setEvents}
+                      onAdd={addEvent}
+                      onDelete={delEvent}
+                    />
+                    <RangesEditor
+                      ranges={ranges}
+                      setRanges={setRanges}
+                      onAdd={addRange}
+                      onDelete={delRange}
+                    />
+                  </div>
+                ) : (
+                  <ReadOnlyNotice />
+                )}
+
+                <div className="text-xs text-gray-500">
+                  Signed-in users can always view the timeline. People with
+                  edit access can drag events to move them, resize ranges,
+                  import/export data, and manage edit access from the
+                  permissions panel.
+                </div>
+              </>
+            )}
           </div>
         );
       }

@@ -1,0 +1,68 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function verifiedGoogleEmail() {
+      return signedIn() &&
+        request.auth.token.email is string &&
+        request.auth.token.email_verified == true;
+    }
+
+    function isWriter() {
+      return verifiedGoogleEmail() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "writer";
+    }
+
+    function isSelf(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    function validRole(role) {
+      return role == "reader" || role == "writer";
+    }
+
+    match /calendars/{calendarId} {
+      allow read: if verifiedGoogleEmail();
+      allow create, update, delete: if isWriter();
+    }
+
+    match /users/{uid} {
+      allow get: if verifiedGoogleEmail() && (isSelf(uid) || isWriter());
+      allow list: if isWriter();
+
+      allow create: if verifiedGoogleEmail() &&
+        isSelf(uid) &&
+        request.resource.data.uid == request.auth.uid &&
+        request.resource.data.email == request.auth.token.email &&
+        request.resource.data.role == "reader";
+
+      allow update: if verifiedGoogleEmail() && (
+        (
+          isSelf(uid) &&
+          request.resource.data.uid == resource.data.uid &&
+          request.resource.data.email == resource.data.email &&
+          request.resource.data.role == resource.data.role &&
+          request.resource.data.createdAt == resource.data.createdAt &&
+          request.resource.data.roleUpdatedAt == resource.data.roleUpdatedAt &&
+          request.resource.data.roleUpdatedByUid == resource.data.roleUpdatedByUid &&
+          request.resource.data.roleUpdatedByEmail == resource.data.roleUpdatedByEmail
+        ) ||
+        (
+          isWriter() &&
+          uid != request.auth.uid &&
+          request.resource.data.uid == resource.data.uid &&
+          request.resource.data.email == resource.data.email &&
+          request.resource.data.createdAt == resource.data.createdAt &&
+          validRole(request.resource.data.role)
+        )
+      );
+
+      allow delete: if false;
+    }
+  }
+}
