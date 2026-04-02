@@ -1158,6 +1158,7 @@
 
         const lastRemoteSerializedRef = useRef("");
         const lastSavedSerializedRef = useRef("");
+        const hasLoadedUserRecordRef = useRef(false);
         const dragState = useRef(null);
         const [hoverISO, setHoverISO] = useState(null);
 
@@ -1183,6 +1184,7 @@
               setUserRecord(null);
               setUsers([]);
               setShowPermissions(false);
+              hasLoadedUserRecordRef.current = false;
             }
           });
           return unsubscribe;
@@ -1215,13 +1217,21 @@
             transaction.update(ref, profileUpdate);
           }).catch((error) => {
             if (!cancelled) {
-              setAuthError(error.message || "Unable to sync your user profile.");
+              // If we already loaded the user's Firestore profile, treat a
+              // later profile refresh failure as non-blocking and avoid
+              // leaving a stale permissions banner on screen.
+              if (!hasLoadedUserRecordRef.current) {
+                setAuthError(
+                  error.message || "Unable to sync your user profile."
+                );
+              }
             }
           });
 
           const unsubscribe = ref.onSnapshot(
             (snapshot) => {
               if (cancelled) return;
+              hasLoadedUserRecordRef.current = snapshot.exists;
               setAuthError("");
               setUserRecord(snapshot.exists ? snapshot.data() : null);
             },
